@@ -1,0 +1,160 @@
+# Salve este conteúdo como lab-ec2-ebs.yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Template do CloudFormation para o Laboratório de EC2 e EBS.
+  Cria uma instância t2.micro com um volume EBS de 8GB adicional,
+  que é automaticamente formatado e montado em /mnt/dados.
+  Também cria uma política de snapshot diária (DLM).
+
+Parameters:
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Nome do par de chaves EC2 para acesso SSH.
+    Default: lab-ec2-key
+  
+  InstanceType:
+    Type: String
+    Description: Tipo da instância EC2.
+    Default: t2.micro
+    
+  MyIP:
+    Type: String
+    Description: "Seu endereço IP para acesso SSH (ex: 1.2.3.4/32)."
+    Default: '0.0.0.0/0'
+
+Resources:
+  # 1. Security Group para permitir SSH
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Permite acesso SSH
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MyIP
+      Tags:
+        - Key: Name
+          Value: lab-ec2-sg
+
+  # 2. A Instância EC2 (agora só com o volume raiz)
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyName
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      Tags:
+        - Key: Name
+          Value: lab-webserver
+      
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda # Volume Raiz
+          Ebs:
+            VolumeSize: 8
+            VolumeType: gp2
+            DeleteOnTermination: true
+
+      # O script UserData continua o mesmo e vai funcionar
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          
+          # Aguarda o volume /dev/xvdf (virtualização de /dev/sdf) aparecer
+          while [ ! -e /dev/xvdf ]; do 
+            sleep 1
+          done
+          
+          # 1. Formata o volume (só se não estiver formatado)
+          if ! sudo file -s /dev/xvdf | grep -q "ext4"; then
+            sudo mkfs.ext4 /dev/xvdf
+          fi
+          
+          # 2. Cria o diretório de montagem
+          sudo mkdir -p /mnt/dados
+          
+          # 3. Monta o volume
+          sudo mount /dev/xvdf /mnt/dados
+          
+          # 4. (BÔNUS) Adiciona ao /etc/fstab para montar automaticamente
+          echo '/dev/xvdf /mnt/dados ext4 defaults,nofail 0 2' | sudo tee -a /etc/fstab
+          
+          # 5. (BÔNUS) Instala um servidor web simples para o cenário
+          yum update -y
+          yum install -y httpd
+          systemctl start httpd
+          systemctl enable httpd
+          echo "<html><h1>Servidor web rodando no volume EBS!</h1></html>" > /var/www/html/index.html
+
+  # 3. (NOVO) O Volume de Dados como um recurso separado
+  DataVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      Size: 8
+      VolumeType: gp2
+      AvailabilityZone: !GetAtt EC2Instance.AvailabilityZone # Garante que está na mesma AZ
+      Tags:
+        - Key: BackupPolicy # A tag que a política de snapshot precisa!
+          Value: Daily
+        - Key: Name
+          Value: lab-data-volume
+
+  # 4. (NOVO) A "Anexação" do volume à instância
+  VolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      InstanceId: !Ref EC2Instance
+      VolumeId: !Ref DataVolume
+      Device: /dev/sdf # Nome do dispositivo que o Linux verá
+
+  # 5. Política de Snapshot Automático (DLM) - CORRIGIDO
+  SnapshotLifecyclePolicy:
+    Type: AWS::DLM::LifecyclePolicy
+    Properties:
+      # AQUI ESTAVA O ERRO (acentuação)
+      Description: Politica de snapshot diaria para o lab
+      State: ENABLED
+      ExecutionRoleArn: !GetAtt DLMExecutionRole.Arn
+      PolicyDetails:
+        ResourceTypes:
+          - VOLUME
+        TargetTags:
+          - Key: BackupPolicy # Vai encontrar o 'DataVolume'
+            Value: Daily
+        Schedules:
+          - Name: DailySnapshots
+            CreateRule:
+              Interval: 24
+              IntervalUnit: HOURS
+              Times:
+                - '03:00'
+            RetainRule:
+              Count: 3
+            TagsToAdd:
+              - Key: CreatedBy
+                Value: DLM-Lifecycle-Policy
+            CopyTags: true
+
+  # 6. Role necessária para o DLM - sem mudanças
+  DLMExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: dlm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSDataLifecycleManagerServiceRole
+
+Outputs:
+  InstanceID:
+    Description: ID da instância EC2 criada
+    Value: !Ref EC2Instance
+  PublicIP:
+    Description: IP Público da instância EC2
+    Value: !GetAtt EC2Instance.PublicDnsName

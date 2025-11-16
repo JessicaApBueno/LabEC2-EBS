@@ -1,0 +1,6 @@
+# Ignorar TODAS as chaves privadas
+*.pem
+
+# Ignorar arquivos de sistema operacional
+.DS_Store
+Thumbs.db
